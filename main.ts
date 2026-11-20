@@ -41,6 +41,62 @@ function pngDimensions(buf: Buffer): { width: number; height: number } {
   };
 }
 
+// CRC-32 (PNG polynomial 0xedb88320), table-built once, stdlib only.
+const CRC_TABLE: number[] = (() => {
+  const table: number[] = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c;
+  }
+  return table;
+})();
+
+function crc32(buf: Buffer, start: number, end: number): number {
+  let c = 0xffffffff;
+  for (let i = start; i < end; i++) {
+    c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// Walk every PNG chunk, verify each chunk's CRC, and require the file
+// to end exactly after a zero-length IEND chunk. A truncated or
+// corrupted PNG is refused here instead of reaching the gate.
+function validatePngChunks(buf: Buffer): void {
+  let offset = 8;
+  let sawIend = false;
+  while (offset + 12 <= buf.length) {
+    const length = buf.readUInt32BE(offset);
+    const type = buf.toString("ascii", offset + 4, offset + 8);
+    const dataEnd = offset + 8 + length;
+    if (dataEnd + 4 > buf.length) {
+      fail(`entry.png is truncated inside chunk ${type}`);
+    }
+    const stored = buf.readUInt32BE(dataEnd);
+    const actual = crc32(buf, offset + 4, dataEnd);
+    if (stored !== actual) {
+      fail(`entry.png chunk ${type} has a bad CRC`);
+    }
+    offset = dataEnd + 4;
+    if (type === "IEND") {
+      if (length !== 0) {
+        fail("entry.png IEND chunk must be empty");
+      }
+      sawIend = true;
+      break;
+    }
+  }
+  if (!sawIend) {
+    fail("entry.png has no IEND chunk");
+  }
+  if (offset !== buf.length) {
+    fail("entry.png has trailing bytes after IEND");
+  }
+}
+
 const outDir = process.env.MAKEFUN_OUTPUT_DIR;
 if (!outDir) {
   fail("MAKEFUN_OUTPUT_DIR is not set");
@@ -61,6 +117,7 @@ if (width > MAX_SIDE || height > MAX_SIDE) {
 if (width === 0 || height === 0) {
   fail("entry.png has a zero dimension");
 }
+validatePngChunks(bytes);
 
 mkdirSync(outDir, { recursive: true });
 const dest = join(outDir, "entry.png");
